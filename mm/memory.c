@@ -954,13 +954,33 @@ copy_present_pte(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
 		rss[mm_counter_file(page)]++;
 	}
 
-	/*
-	 * If it's a COW mapping, write protect it both
-	 * in the parent and the child
-	 */
-	if (is_cow_mapping(vm_flags) && pte_write(pte)) {
-		ptep_set_wrprotect(src_mm, addr, src_pte);
-		pte = pte_wrprotect(pte);
+	// TODO: we should improve the logic to decide if we should trap read accesses for this children. Maybe creating a prctl flag for parent checkpoint.
+	if(strcmp(current->comm, "thesis_test") == 0){
+		pr_info_ratelimited("THESIS [PID %d]: Setting PROT_NONE trap for parent and child!\n", current->pid);
+
+		// this couldnt be wrapped by pte_write(), because then we would only trap reads on writable pages, but we should also trap reads on read only pages
+
+		// 1. Parent gets standard Write-Protection
+		// we dont need to copy the page when the parent reads
+		// but if the parent writes, we want to keep the original data atm of the fork for the children to access
+		ptep_set_wrprotect(src_vma->vm_mm, addr, src_pte);
+
+		// 2. Child gets PROT_NONE to trap on every read access.
+		// PROT_NONE is the kernel way of trapping the cpu on all reads while knowing the page is actually present
+		// this call puts the pte bits present=0, protnone=1
+		pte = pte_modify(pte, PAGE_NONE);
+	}
+	else{
+		/*
+		* If it's a COW mapping, write protect it both
+		* in the parent and the child
+		*/
+		if (is_cow_mapping(vm_flags) && pte_write(pte)) {
+
+			ptep_set_wrprotect(src_mm, addr, src_pte);
+			pte = pte_wrprotect(pte);
+
+		}
 	}
 	VM_BUG_ON(page && folio_test_anon(folio) && PageAnonExclusive(page));
 
@@ -3033,6 +3053,117 @@ static inline void wp_page_reuse(struct vm_fault *vmf)
 	count_vm_event(PGREUSE);
 }
 
+static vm_fault_t do_thesis_page(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	struct page *old_page;
+	struct folio *old_folio = NULL;
+	struct folio *new_folio = NULL;
+	pte_t pte, old_pte, new_pte;
+
+	// 1. LOCK AND VALIDATE (From do_numa_page)
+	spin_lock(vmf->ptl);
+	if (unlikely(!pte_same(ptep_get(vmf->pte), vmf->orig_pte))) {
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+		return 0;
+	}
+
+	old_pte = ptep_get(vmf->pte);
+	pte = pte_modify(old_pte, vma->vm_page_prot); // Strip PROT_NONE
+
+	old_page = vm_normal_page(vma, vmf->address, pte);
+	if (!old_page) {
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+		return 0;
+	}
+
+	// Set vmf->page so the kernel's copy routines know what we are copying from
+	vmf->page = old_page;
+	old_folio = page_folio(old_page);
+
+	// pr_info_ratelimited("THESIS [PID %d]: Access trapped! Page is shared (mapcount %d). COPYING IT.\n",
+	// current->pid, folio_mapcount(old_folio));
+	pr_info_ratelimited("THESIS [PID %d]: Child fell on CXL page trap! Forcing local migration/copy before access.\n", current->pid);
+
+	// Pin the old CXL folio so it doesn't get freed while we drop the lock
+	folio_get(old_folio);
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+
+
+	// 2. ALLOCATE LOCAL & COPY
+	// linux 6.6 copy logic (From wp_page_copy)
+
+	// Because the child's CPU is running this fault, vma_alloc_folio will
+	// automatically allocate this new physical page on the local NUMA node!
+	new_folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE, 0, vma, vmf->address, false);
+	if (!new_folio) {
+		folio_put(old_folio);
+		return VM_FAULT_OOM;
+	}
+
+	// Copy the bytes from CXL to local DRAM
+	if (__wp_page_copy_user(&new_folio->page, vmf->page, vmf)) {
+		folio_put(new_folio);
+		folio_put(old_folio);
+		return VM_FAULT_OOM;
+	}
+
+	__folio_mark_uptodate(new_folio);
+
+	// 3. UPDATE PAGE TABLES
+	// Re-take the lock
+	vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);
+
+	// Check if someone else already copied it while we were unlocked
+	if (unlikely(!pte_same(ptep_get(vmf->pte), vmf->orig_pte))) {
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+		folio_put(new_folio);
+		folio_put(old_folio);
+		return 0;
+	}
+
+	// Build the new PTE pointing to local memory
+	new_pte = mk_pte(&new_folio->page, vma->vm_page_prot);
+	new_pte = pte_sw_mkyoung(new_pte);
+
+	if (vma->vm_flags & VM_WRITE) {
+		new_pte = maybe_mkwrite(pte_mkdirty(new_pte), vma);
+	}
+
+	// Replace the PROT_NONE trap with the writable, local PTE
+	ptep_clear_flush(vma, vmf->address, vmf->pte);
+
+	// Bookkeeping for the new page
+	folio_add_new_anon_rmap(new_folio, vma, vmf->address);
+	folio_add_lru_vma(new_folio, vma);
+
+	set_pte_at_notify(mm, vmf->address, vmf->pte, new_pte);
+	update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
+
+	pr_info_ratelimited("THESIS [PID %d]: Migrated from PFN %lx (Node %d) -> PFN %lx (Node %d)\n",
+					 current->pid,
+					 page_to_pfn(old_page),
+					 page_to_nid(old_page),
+					 folio_pfn(new_folio),
+					 folio_nid(new_folio));
+	// 4. CLEANUP CXL PAGE
+	// Disconnect the child's VMA from the old CXL page
+	// meaning detach the old page from this process
+	page_remove_rmap(vmf->page, vma, false);
+
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+
+	// Drop the references to the old page
+	folio_put(old_folio); // Drop the pin we took
+	// Drop the child's original page table reference to the CXL page
+	// (If mapcount was 1, this frees the CXL page completely!)
+	folio_put(old_folio);
+
+	pr_info_ratelimited("THESIS [PID %d]: Copy complete. Process has its own page!\n", current->pid);
+	return 0;
+}
+
 /*
  * Handle the case of a page which we actually need to copy to a new page,
  * either due to COW or unsharing.
@@ -4983,8 +5114,16 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
 	if (!pte_present(vmf->orig_pte))
 		return do_swap_page(vmf);
 
-	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma))
+	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma)) {
+		//here
+		if(strcmp(current->comm, "thesis_test") == 0){
+			pr_info_ratelimited("THESIS [PID %d]: Page Fault catched by us! Calling do_thesis_page\n", current->pid);
+			return do_thesis_page(vmf);
+		}
+		pr_info_ratelimited("THESIS [PID %d]: PANIC this should not happen. NUMA should be disable, is it?\n", current->pid);
+		// falling back to numa anyways
 		return do_numa_page(vmf);
+	}
 
 	spin_lock(vmf->ptl);
 	entry = vmf->orig_pte;

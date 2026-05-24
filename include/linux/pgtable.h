@@ -1417,7 +1417,8 @@ static inline int pud_trans_unstable(pud_t *pud)
  */
 static inline int pte_protnone(pte_t pte)
 {
-	return 0;
+	return (pte_flags(pte) & (_PAGE_PROTNONE | _PAGE_PRESENT))
+		== _PAGE_PROTNONE;
 }
 
 static inline int pmd_protnone(pmd_t pmd)
