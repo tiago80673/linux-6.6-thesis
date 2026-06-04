@@ -2874,9 +2874,6 @@ pid_t kernel_clone(struct kernel_clone_args *args)
 	int trace = 0;
 	pid_t nr;
 
-	/* HELLO WORLD */
-    pr_info("THESIS LOG: kernel_clone called! We will be changing things.\n");
-
 	/*
 	 * For legacy clone() calls, CLONE_PIDFD uses the parent_tid argument
 	 * to return the pidfd. Hence, CLONE_PIDFD and CLONE_PARENT_SETTID are
