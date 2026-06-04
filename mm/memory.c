@@ -965,10 +965,18 @@ copy_present_pte(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
 		// but if the parent writes, we want to keep the original data atm of the fork for the children to access
 		ptep_set_wrprotect(src_vma->vm_mm, addr, src_pte);
 
-		// 2. Child gets PROT_NONE to trap on every read access.
-		// PROT_NONE is the kernel way of trapping the cpu on all reads while knowing the page is actually present
-		// this call puts the pte bits present=0, protnone=1
-		pte = pte_modify(pte, PAGE_NONE);
+		if (vma_is_anonymous(src_vma)) {
+			// 2. Child gets PROT_NONE to trap on every read access.
+			// PROT_NONE is the kernel way of trapping the cpu on all reads while knowing the page is actually present
+			// this call puts the pte bits present=0, protnone=1
+			pte = pte_modify(pte, PAGE_NONE);
+		}
+		else{
+			// default CoW for libraries and file backed
+			// keep those in CXL for now, as we figure how to make a copy of the page cache to local DRAM
+			pte = pte_wrprotect(pte);
+		}
+
 	}
 	else{
 		/*
@@ -3193,7 +3201,7 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 	struct mmu_notifier_range range;
 	int ret;
 
-	delayacct_wpcopy_start();
+	delayacct_wpcopy_start(); //performance metrics time
 
 	if (vmf->page)
 		old_folio = page_folio(vmf->page);
@@ -3201,15 +3209,18 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 		goto oom;
 
 	if (is_zero_pfn(pte_pfn(vmf->orig_pte))) {
+		//optimization to allocate a page full of zeros / faster than copying
 		new_folio = vma_alloc_zeroed_movable_folio(vma, vmf->address);
 		if (!new_folio)
 			goto oom;
 	} else {
+		//normal CoW
 		new_folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE, 0, vma,
 				vmf->address, false);
 		if (!new_folio)
 			goto oom;
 
+		//copy page contents
 		ret = __wp_page_copy_user(&new_folio->page, vmf->page, vmf);
 		if (ret) {
 			/*
@@ -3226,15 +3237,19 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 			delayacct_wpcopy_end();
 			return ret == -EHWPOISON ? VM_FAULT_HWPOISON : 0;
 		}
+		//copy metadata
 		kmsan_copy_page_meta(&new_folio->page, vmf->page);
 	}
 
+	//ownership, accounting for new memory
 	if (mem_cgroup_charge(new_folio, mm, GFP_KERNEL))
 		goto oom_free_new;
+	//what's this for?
 	folio_throttle_swaprate(new_folio, GFP_KERNEL);
 
 	__folio_mark_uptodate(new_folio);
 
+	//invalidate 
 	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, mm,
 				vmf->address & PAGE_MASK,
 				(vmf->address & PAGE_MASK) + PAGE_SIZE);
@@ -3255,14 +3270,17 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 			inc_mm_counter(mm, MM_ANONPAGES);
 		}
 		flush_cache_page(vma, vmf->address, pte_pfn(vmf->orig_pte));
+		//construct new PTE
 		entry = mk_pte(&new_folio->page, vma->vm_page_prot);
 		entry = pte_sw_mkyoung(entry);
 		if (unlikely(unshare)) {
+			//unshare op
 			if (pte_soft_dirty(vmf->orig_pte))
 				entry = pte_mksoft_dirty(entry);
 			if (pte_uffd_wp(vmf->orig_pte))
 				entry = pte_mkuffd_wp(entry);
 		} else {
+			//normal CoW
 			entry = maybe_mkwrite(pte_mkdirty(entry), vma);
 		}
 
@@ -3276,6 +3294,7 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 		ptep_clear_flush(vma, vmf->address, vmf->pte);
 		folio_add_new_anon_rmap(new_folio, vma, vmf->address);
 		folio_add_lru_vma(new_folio, vma);
+		//do we need this in copying read accesses?:
 		/*
 		 * We call the notify macro here because, when using secondary
 		 * mmu page tables (such as kvm shadow page tables), we want the
@@ -3325,6 +3344,7 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 		folio_put(new_folio);
 	if (old_folio) {
 		if (page_copied)
+			//do we need this in CoA
 			free_swap_cache(&old_folio->page);
 		folio_put(old_folio);
 	}
@@ -5127,6 +5147,10 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
 
 	spin_lock(vmf->ptl);
 	entry = vmf->orig_pte;
+	// this pte_same check is an optimization, because of multithreading. We are checking if the PTE still matches what we observed when starting the fault, or whether someone has already handled/modified it?
+	// if so, we avoid doing any further expensive unnecessary work.
+	// We will release the plt inside do_wp_page but before doing the actual allocation and copying to the new page
+	// So, at the end, when updating the PTE, we will need to retake the ptl + recheck if the PTE is still the same again
 	if (unlikely(!pte_same(ptep_get(vmf->pte), entry))) {
 		update_mmu_tlb(vmf->vma, vmf->address, vmf->pte);
 		goto unlock;
