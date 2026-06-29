@@ -955,7 +955,21 @@ copy_present_pte(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
 	}
 
 	// TODO: we should improve the logic to decide if we should trap read accesses for this children. Maybe creating a prctl flag for parent checkpoint.
-	if(strcmp(current->comm, "thesis_test") == 0){
+	//
+	// CoA only applies to PRIVATE anonymous pages:
+	//  - vma_is_anonymous() alone is NOT enough: it is also true for
+	//    MAP_SHARED|MAP_ANONYMOUS regions (it only checks vm_file == NULL).
+	//    Trapping a shared page would make do_thesis_page() copy it into a
+	//    private folio, silently breaking the sharing (e.g. AFL's shared
+	//    coverage map: the child would write coverage into its own copy that
+	//    the fuzzer never sees -> fork-server hang).
+	//  - VM_SHARED pages must also NOT be write-protected in the parent;
+	//    writes to them have to stay visible to all sharers.
+	// So we arm CoA only for anonymous && !VM_SHARED. Everything else
+	// (shared-anon, file-backed libraries) falls back to standard fork
+	// handling below.
+	if (strcmp(current->comm, "thesis_test") == 0 &&
+	    vma_is_anonymous(src_vma) && !(vm_flags & VM_SHARED)) {
 		pr_info_ratelimited("THESIS [PID %d]: Setting PROT_NONE trap for parent and child!\n", current->pid);
 
 		// this couldnt be wrapped by pte_write(), because then we would only trap reads on writable pages, but we should also trap reads on read only pages
@@ -965,18 +979,10 @@ copy_present_pte(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
 		// but if the parent writes, we want to keep the original data atm of the fork for the children to access
 		ptep_set_wrprotect(src_vma->vm_mm, addr, src_pte);
 
-		if (vma_is_anonymous(src_vma)) {
-			// 2. Child gets PROT_NONE to trap on every read access.
-			// PROT_NONE is the kernel way of trapping the cpu on all reads while knowing the page is actually present
-			// this call puts the pte bits present=0, protnone=1
-			pte = pte_modify(pte, PAGE_NONE);
-		}
-		else{
-			// default CoW for libraries and file backed
-			// keep those in CXL for now, as we figure how to make a copy of the page cache to local DRAM
-			pte = pte_wrprotect(pte);
-		}
-
+		// 2. Child gets PROT_NONE to trap on every read access.
+		// PROT_NONE is the kernel way of trapping the cpu on all reads while knowing the page is actually present
+		// this call puts the pte bits present=0, protnone=1
+		pte = pte_modify(pte, PAGE_NONE);
 	}
 	else{
 		/*
