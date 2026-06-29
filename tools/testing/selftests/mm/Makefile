@@ -73,6 +73,9 @@ ifneq ($(ARCH),arm64)
 TEST_GEN_PROGS += soft-dirty
 endif
 
+# THESIS: Copy-on-Access correctness test (custom fork path in mm/memory.c).
+TEST_GEN_PROGS += coa_test
+
 ifeq ($(ARCH),x86_64)
 CAN_BUILD_I386 := $(shell ./../x86/check_cc.sh "$(CC)" ../x86/trivial_32bit_program.c -m32)
 CAN_BUILD_X86_64 := $(shell ./../x86/check_cc.sh "$(CC)" ../x86/trivial_64bit_program.c)
