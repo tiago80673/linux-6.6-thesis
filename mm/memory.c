@@ -77,6 +77,7 @@
 #include <linux/ptrace.h>
 #include <linux/vmalloc.h>
 #include <linux/sched/sysctl.h>
+#include <linux/debugfs.h>
 
 #include <trace/events/kmem.h>
 
@@ -3067,6 +3068,23 @@ static inline void wp_page_reuse(struct vm_fault *vmf)
 	count_vm_event(PGREUSE);
 }
 
+/*
+ * THESIS: exact count of CoA migrations performed by do_thesis_page().
+ * Exposed at /sys/kernel/debug/thesis_coa_faults so userspace sanity tests
+ * (tools/testing/selftests/mm/coa_test.c) can assert the handler actually ran
+ * -- the "mechanism" signal complementing the move_pages() "effect" check.
+ * Unlike the pr_info logs this is never ratelimited, so the count is precise.
+ */
+static atomic_t thesis_coa_faults = ATOMIC_INIT(0);
+
+static int __init thesis_debugfs_init(void)
+{
+	debugfs_create_atomic_t("thesis_coa_faults", 0444, NULL,
+				&thesis_coa_faults);
+	return 0;
+}
+late_initcall(thesis_debugfs_init);
+
 static vm_fault_t do_thesis_page(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
@@ -3154,6 +3172,9 @@ static vm_fault_t do_thesis_page(struct vm_fault *vmf)
 
 	set_pte_at_notify(mm, vmf->address, vmf->pte, new_pte);
 	update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
+
+	/* THESIS: migration is now committed -- count it for the sanity test. */
+	atomic_inc(&thesis_coa_faults);
 
 	pr_info_ratelimited("THESIS [PID %d]: Migrated from PFN %lx (Node %d) -> PFN %lx (Node %d)\n",
 					 current->pid,
