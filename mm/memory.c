@@ -971,6 +971,8 @@ copy_present_pte(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
 	// handling below.
 	if (strcmp(current->comm, "thesis_test") == 0 &&
 	    vma_is_anonymous(src_vma) && !(vm_flags & VM_SHARED)) {
+	// if ((vm_flags & VM_THESIS_COA) &&
+    //    vma_is_anonymous(src_vma) && !(vm_flags & VM_SHARED)) {
 		pr_info_ratelimited("THESIS [PID %d]: Setting PROT_NONE trap for parent and child!\n", current->pid);
 
 		// this couldnt be wrapped by pte_write(), because then we would only trap reads on writable pages, but we should also trap reads on read only pages
@@ -3106,6 +3108,13 @@ static vm_fault_t do_thesis_page(struct vm_fault *vmf)
 
 	old_page = vm_normal_page(vma, vmf->address, pte);
 	if (!old_page) {
+		/* Zero page / special mapping: nothing on the slow tier to migrate.
+		 * Clear the PROT_NONE trap so the access proceeds (a later write will
+		 * COW normally) instead of returning into an infinite re-fault. This
+		 * is the livelock that froze AFL children on untouched anon (zero) pages
+		 * while the fully-populated standalone bench never hit it. */
+		set_pte_at(mm, vmf->address, vmf->pte, pte);
+		update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
 		pte_unmap_unlock(vmf->pte, vmf->ptl);
 		return 0;
 	}
@@ -3126,9 +3135,16 @@ static vm_fault_t do_thesis_page(struct vm_fault *vmf)
 	// 2. ALLOCATE LOCAL & COPY
 	// linux 6.6 copy logic (From wp_page_copy)
 
-	// Because the child's CPU is running this fault, vma_alloc_folio will
-	// automatically allocate this new physical page on the local NUMA node!
-	new_folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE, 0, vma, vmf->address, false);
+	// Force the copy onto the faulting CPU's local NUMA node.
+	//
+	// We deliberately do NOT use vma_alloc_folio() here: it honours the VMA's
+	// mempolicy, so if the checkpoint region was placed with mbind(MPOL_BIND,
+	// slow_node) the "migration" would reallocate the page right back on the
+	// slow node (verified with move_pages: dest stayed on node 1). CoA's
+	// contract is "migrate to the accessor's local node", so allocate there
+	// explicitly and ignore any inherited policy. numa_node_id() is the node of
+	// the CPU running this fault == the child's local (fast) tier.
+	new_folio = __folio_alloc_node(GFP_HIGHUSER_MOVABLE, 0, numa_node_id());
 	if (!new_folio) {
 		folio_put(old_folio);
 		return VM_FAULT_OOM;
