@@ -2720,6 +2720,19 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 	case PR_RISCV_V_GET_CONTROL:
 		error = RISCV_V_GET_CONTROL();
 		break;
+	case PR_SET_THESIS_COA:
+		/* THESIS: select the Copy-on-Access algorithm (arg2, 0 = off). */
+		if (arg3 || arg4 || arg5)
+			return -EINVAL;
+		if (arg2 >= PR_THESIS_COA_MAX)
+			return -EINVAL;
+		me->thesis_coa_mode = arg2;
+		break;
+	case PR_GET_THESIS_COA:
+		if (arg2 || arg3 || arg4 || arg5)
+			return -EINVAL;
+		error = me->thesis_coa_mode;
+		break;
 	default:
 		error = -EINVAL;
 		break;

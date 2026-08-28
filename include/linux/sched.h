@@ -959,6 +959,14 @@ struct task_struct {
 	/* delay due to memory thrashing */
 	unsigned                        in_thrashing:1;
 #endif
+	/*
+	 * THESIS: active Copy-on-Access algorithm for this task, set via
+	 * prctl(PR_SET_THESIS_COA, mode). 0 = disabled; non-zero selects a
+	 * variant (see PR_THESIS_COA_* in uapi/linux/prctl.h). Inherited across
+	 * fork by the struct copy in dup_task_struct(), so children stay armed
+	 * with the same variant. 4 bits = up to 15 variants.
+	 */
+	unsigned			thesis_coa_mode:4;
 
 	unsigned long			atomic_flags; /* Flags requiring atomic access. */
 

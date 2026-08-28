@@ -3,7 +3,8 @@
  * THESIS Copy-on-Access (CoA) correctness selftest.
  *
  * Verifies the custom fork path in mm/memory.c (copy_present_pte +
- * do_thesis_page). When a process named "thesis_test" forks, the child's
+ * do_thesis_page). When a process opted in via prctl(PR_SET_THESIS_COA, mode)
+ * (with a non-off algorithm) forks, the child's
  * PRIVATE anonymous PTEs are set PROT_NONE; the first *read* of such a page
  * traps into do_thesis_page(), which copies the page to the child's local
  * NUMA node. Shared and file-backed mappings must be left untouched.
@@ -57,6 +58,18 @@
 
 #define COUNTER_PATH "/sys/kernel/debug/thesis_coa_faults"
 #define DEBUGFS_DIR  "/sys/kernel/debug"
+
+/* CoA prctl + algorithm modes (must match the kernel headers). */
+#define PR_SET_THESIS_COA  0x54484553   /* include/uapi/linux/prctl.h */
+#define COA_OFF   0
+#define COA_NAIVE 1
+
+/* Select this process's CoA algorithm (per-task; inherited across fork; no root).
+ * mode 0 disables. Returns 0 on success, -1 if the kernel lacks the prctl. */
+static int arm_coa(int mode)
+{
+	return prctl(PR_SET_THESIS_COA, mode, 0, 0, 0);
+}
 
 /* Distinct byte patterns so we can tell parent fill from child overwrite. */
 static inline unsigned char parent_byte(int i) { return (unsigned char)(0xA5 ^ (i * 7)); }
@@ -208,7 +221,8 @@ int main(void)
 			 "T1 setup: %d/%d private pages resident on slow node %d\n",
 			 on_slow, NPAGES, SLOW_NODE);
 
-	prctl(PR_SET_NAME, "thesis_test", 0, 0, 0);   /* arm CoA */
+	if (arm_coa(COA_NAIVE))                        /* opt in: naive CoA */
+		ksft_exit_skip("prctl(PR_SET_THESIS_COA) unsupported (non-thesis kernel?)\n");
 	c0 = read_counter();
 	pid = fork();
 	if (pid == 0) {
@@ -246,7 +260,7 @@ int main(void)
 	/* T2: control -- NOT armed; a child read must leave pages on slow.    */
 	/* ------------------------------------------------------------------ */
 	r = make_region(0);
-	prctl(PR_SET_NAME, "coa_ctl", 0, 0, 0);       /* disarm */
+	arm_coa(COA_OFF);                             /* opt out (disarmed) */
 	c0 = read_counter();
 	pid = fork();
 	if (pid == 0) {
@@ -271,7 +285,7 @@ int main(void)
 	/* or copied; the child's writes stay visible to the parent.           */
 	/* ------------------------------------------------------------------ */
 	r = make_region(1);
-	prctl(PR_SET_NAME, "thesis_test", 0, 0, 0);   /* arm CoA */
+	arm_coa(COA_NAIVE);                           /* opt in (armed) */
 	pid = fork();
 	if (pid == 0) {
 		pin_node(FAST_NODE);

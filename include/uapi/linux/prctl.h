@@ -305,4 +305,19 @@ struct prctl_mm_map {
 # define PR_RISCV_V_VSTATE_CTRL_NEXT_MASK	0xc
 # define PR_RISCV_V_VSTATE_CTRL_MASK		0x1f
 
+/*
+ * THESIS: select the Copy-on-Access algorithm for this process (and, via fork
+ * inheritance, its children). arg2 is one of PR_THESIS_COA_* below; 0 disables.
+ * The mode travels with the task -- no global state, no root needed.
+ */
+#define PR_SET_THESIS_COA		0x54484553	/* 'THES' */
+#define PR_GET_THESIS_COA		0x54484554	/* 'THET' */
+/* CoA algorithm selector (arg2 to PR_SET_THESIS_COA). Stable numbering. */
+# define PR_THESIS_COA_OFF		0	/* stock COW-on-fork (baseline) */
+# define PR_THESIS_COA_NAIVE		1	/* V0: private copy per child on access */
+# define PR_THESIS_COA_SHARED_SYNC	2	/* V1: faulter remaps all siblings (sync) */
+# define PR_THESIS_COA_SHARED_ASYNC	3	/* V2: background thread sweeps siblings */
+# define PR_THESIS_COA_SHARED_LAZY	4	/* V3: each child remaps itself on its fault */
+# define PR_THESIS_COA_MAX		5	/* exclusive upper bound for validation */
+
 #endif /* _LINUX_PRCTL_H */

@@ -41,6 +41,7 @@
 
 #include <linux/kernel_stat.h>
 #include <linux/mm.h>
+#include <linux/prctl.h>		/* THESIS: PR_THESIS_COA_* mode numbers */
 #include <linux/mm_inline.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/coredump.h>
@@ -917,6 +918,39 @@ copy_present_page(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
 }
 
 /*
+ * THESIS: Copy-on-Access algorithm selector.
+ *
+ * The active variant is per-task, carried by prctl(PR_SET_THESIS_COA, mode)
+ * and inherited across fork -- so it travels with the process, needs no root,
+ * and one boot can A/B every arm just by launching each with a different mode.
+ * Read at fork time (whether to arm PROT_NONE traps) and at fault time (which
+ * handler to dispatch). Values mirror PR_THESIS_COA_* in uapi/linux/prctl.h.
+ *
+ *   OFF          - stock kernel, no traps armed (baseline).
+ *   NAIVE        - V0: private copy per child on first access (today's baseline).
+ *   SHARED_SYNC  - V1: faulter copies + synchronously remaps all siblings.
+ *   SHARED_ASYNC - V2: faulter fixes itself; a kthread sweeps siblings later.
+ *   SHARED_LAZY  - V3: each child remaps only itself on its own fault.
+ *
+ * V1/V2/V3 are reserved here so the numbering is a stable contract; until their
+ * handlers land they fall back to NAIVE (see the fault dispatch below), so the
+ * scaffolding is measurable now and adding a variant is just "fill in the case".
+ */
+enum thesis_coa_mode {
+	THESIS_COA_OFF		= PR_THESIS_COA_OFF,
+	THESIS_COA_NAIVE	= PR_THESIS_COA_NAIVE,
+	THESIS_COA_SHARED_SYNC	= PR_THESIS_COA_SHARED_SYNC,
+	THESIS_COA_SHARED_ASYNC	= PR_THESIS_COA_SHARED_ASYNC,
+	THESIS_COA_SHARED_LAZY	= PR_THESIS_COA_SHARED_LAZY,
+};
+
+/* True when this task should take the CoA fork/fault path. */
+static inline bool thesis_coa_active(void)
+{
+	return current->thesis_coa_mode != THESIS_COA_OFF;
+}
+
+/*
  * Copy one pte.  Returns 0 if succeeded, or -EAGAIN if one preallocated page
  * is required to copy this pte.
  */
@@ -969,11 +1003,10 @@ copy_present_pte(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
 	// So we arm CoA only for anonymous && !VM_SHARED. Everything else
 	// (shared-anon, file-backed libraries) falls back to standard fork
 	// handling below.
-	if (strcmp(current->comm, "thesis_test") == 0 &&
+	if (thesis_coa_active() &&
 	    vma_is_anonymous(src_vma) && !(vm_flags & VM_SHARED)) {
-	// if ((vm_flags & VM_THESIS_COA) &&
-    //    vma_is_anonymous(src_vma) && !(vm_flags & VM_SHARED)) {
-		pr_info_ratelimited("THESIS [PID %d]: Setting PROT_NONE trap for parent and child!\n", current->pid);
+		pr_info_ratelimited("THESIS [PID %d]: Setting PROT_NONE trap for parent and child (mode %u)!\n",
+				    current->pid, current->thesis_coa_mode);
 
 		// this couldnt be wrapped by pte_write(), because then we would only trap reads on writable pages, but we should also trap reads on read only pages
 
@@ -3083,6 +3116,11 @@ static int __init thesis_debugfs_init(void)
 {
 	debugfs_create_atomic_t("thesis_coa_faults", 0444, NULL,
 				&thesis_coa_faults);
+	/*
+	 * NOTE: the algorithm is selected per-task via prctl(PR_SET_THESIS_COA,
+	 * mode), not globally -- so there is no writable mode knob here. Only the
+	 * read-only fault counter above (and, later, Pillar-2 phase stats).
+	 */
 	return 0;
 }
 late_initcall(thesis_debugfs_init);
@@ -5178,10 +5216,33 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
 		return do_swap_page(vmf);
 
 	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma)) {
-		//here
-		if(strcmp(current->comm, "thesis_test") == 0){
-			pr_info_ratelimited("THESIS [PID %d]: Page Fault catched by us! Calling do_thesis_page\n", current->pid);
-			return do_thesis_page(vmf);
+		/*
+		 * A PROT_NONE trap. If this task opted into CoA (its per-task
+		 * mode is non-OFF, inherited from the parent at fork), the trap
+		 * is ours -- dispatch on the active mode. Otherwise fall through
+		 * to do_numa_page (which is disabled in this config), matching
+		 * upstream behaviour for a task that never armed CoA.
+		 */
+		if (current->thesis_coa_mode != THESIS_COA_OFF) {
+			pr_info_ratelimited("THESIS [PID %d]: CoA trap (mode %u); dispatching handler\n",
+					    current->pid, current->thesis_coa_mode);
+			switch (current->thesis_coa_mode) {
+			case THESIS_COA_NAIVE:
+				return do_thesis_page(vmf);
+			case THESIS_COA_SHARED_SYNC:
+			case THESIS_COA_SHARED_ASYNC:
+			case THESIS_COA_SHARED_LAZY:
+				/*
+				 * Reserved variants -- handlers not written yet.
+				 * Fall back to naive so the mode is still runnable
+				 * and measurable; each case gets its own handler.
+				 */
+				pr_warn_ratelimited("THESIS [PID %d]: CoA mode %u not implemented yet, using naive\n",
+						    current->pid, current->thesis_coa_mode);
+				return do_thesis_page(vmf);
+			default:
+				return do_thesis_page(vmf);
+			}
 		}
 		pr_info_ratelimited("THESIS [PID %d]: PANIC this should not happen. NUMA should be disable, is it?\n", current->pid);
 		// falling back to numa anyways
