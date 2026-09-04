@@ -181,6 +181,19 @@ int main(void)
 					ok++;
 				s->pfn[k][i] = pfn_of(pmfd, &r[i * PAGE_SZ]);
 			}
+			/* Optional write+verify: each child writes a byte per page (COW off
+			 * the shared RO copy) and reads it back. Exercises the write path
+			 * that BFS hits and the single-child test otherwise misses. */
+			if (getenv("COA_WRITE")) {
+				for (i = 0; i < NPAGES; i++) {
+					r[i * PAGE_SZ + 1] = (unsigned char)(k * 13 + i);
+					if ((unsigned char)r[i * PAGE_SZ + 1] !=
+					    (unsigned char)(k * 13 + i))
+						ok = -1;                /* COW readback wrong */
+					if ((unsigned char)r[i * PAGE_SZ] != parent_byte(i))
+						ok = -1;                /* clobbered read byte */
+				}
+			}
 			s->bytes_ok[k] = ok;
 			__sync_add_and_fetch(&s->recorded, 1);
 			close(rel[1]);               /* child drops its write end */
@@ -197,6 +210,11 @@ int main(void)
 		sched_yield();
 
 	free_after = node_memfree_kb(FAST_NODE);
+
+	/* DIAG: per-child bytes_ok and the PFN each child saw at offsets 0 and 1. */
+	for (k = 0; k < NKIDS; k++)
+		ksft_print_msg("child %d: bytes_ok=%d pfn[0]=%#lx pfn[1]=%#lx\n",
+			       k, s->bytes_ok[k], s->pfn[k][0], s->pfn[k][1]);
 
 	/* 1. correctness: every child read the parent's bytes correctly. */
 	{
@@ -270,8 +288,15 @@ int main(void)
 
 		ksft_print_msg("node %d MemFree: %ld -> %ld kB (delta %ld kB); ideal lazy=%ld naive=%ld\n",
 			       FAST_NODE, free_before, free_after, used_kb, lazy_kb, naive_kb);
-		/* Loose gate: node-0 growth is far below the naive footprint for lazy. */
-		if (mode == COA_SHARED_LAZY)
+		/*
+		 * The dedup gate only holds when children READ the shared page. Under
+		 * COA_WRITE every child writes every page, so each COWs a private copy
+		 * (no sharing by design) and growth is ~naive -- skip the gate then.
+		 */
+		if (getenv("COA_WRITE"))
+			ksft_test_result(1, "write workload: node-0 growth %ld kB "
+					 "(full COW duplication expected)\n", used_kb);
+		else if (mode == COA_SHARED_LAZY)
 			ksft_test_result(used_kb < naive_kb / 2,
 					 "LAZY: node-0 growth %ld kB well under naive %ld kB\n",
 					 used_kb, naive_kb);

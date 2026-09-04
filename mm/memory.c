@@ -3116,29 +3116,71 @@ static inline void wp_page_reuse(struct vm_fault *vmf)
 static atomic_t thesis_coa_faults = ATOMIC_INIT(0);
 
 /*
- * THESIS V3 (SHARED_LAZY): rendezvous table for shared copy-on-access.
+ * THESIS V3 (SHARED_LAZY): per-fork-family rendezvous table for shared CoA.
  *
  * Whereas naive CoA (do_thesis_page) copies the slow-tier shadow page into a
  * PRIVATE local folio for every child, V3 promotes each shadow page ONCE and
- * lets every child share that single local copy F. This table is the physical
- * home of the per-shadow-page "copy status" keyed by the shadow page's PFN:
+ * lets every child share that single local copy F.
+ *
+ * The table lives on the fork family's ROOT anon_vma (anon_vma->root->coa_table,
+ * lazily allocated on first promotion) and is keyed by the shadow page's PFN:
  *
  *   absent (NULL)            -> not copied yet
  *   THESIS_COA_INPROGRESS    -> a child is copying right now; others re-fault
- *   struct folio *F          -> the shared local copy (the "base address")
+ *   struct folio *F          -> the shared local copy
+ *
+ * Keying by the physical shadow PFN records the promotion against the page's
+ * physical identity, so every virtual address that resolves this S finds the one
+ * F (and aliased mappings dedup to it). Within a live family the PFN is unique
+ * per logical page and stable: the checkpoint parent pins every S, so none is
+ * freed (hence no PFN reuse) while the family -- and this table -- lives.
+ *
+ * Scoping to the root anon_vma (rather than a global table) is what makes this
+ * correct AND concurrency-safe: every child of one checkpoint shares that root,
+ * unrelated families get their own table, and the table is freed with the
+ * anon_vma (thesis_coa_family_table_free) when the last family member exits --
+ * so an entry never outlives the shadow pages it describes, and a recycled PFN
+ * can never resolve to a stale F from a dead family.
  *
  * The entry, when it holds F, owns ONE reference on F (folio_get at publish).
  * That reference does double duty: it keeps F alive across gaps where no child
  * maps it, and it forces do_wp_page to COPY rather than reuse F in place (the
  * reuse gate requires folio_ref_count == 1; the table ref keeps it >= 2), so a
  * writer never corrupts the page other children still read.
- *
- * V3.0 simplifications (assume the checkpoint owner lives forever, so the
- * shadow and its root anon_vma never go away): entries and their F reference
- * are never reclaimed (leaked), and the table is global rather than per-mm.
  */
-static DEFINE_XARRAY(thesis_coa_ptable);
 #define THESIS_COA_INPROGRESS	xa_mk_value(1)
+
+/* THESIS V3 debug: which path each lazy fault took (read at thesis_coa_paths). */
+static atomic_t coa_p_copier = ATOMIC_INIT(0);	/* copied S->F and installed */
+static atomic_t coa_p_sharer = ATOMIC_INIT(0);	/* mapped an existing shared F */
+static atomic_t coa_p_spin   = ATOMIC_INIT(0);	/* saw INPROGRESS, re-faulted */
+static atomic_t coa_p_race   = ATOMIC_INIT(0);	/* install pte_same bail */
+static atomic_t coa_p_zero   = ATOMIC_INIT(0);	/* vm_normal_page NULL bail */
+
+/*
+ * Release a fork family's shared-CoA table (called from anon_vma_free when the
+ * root anon_vma is torn down, i.e. the whole family has exited). By now every
+ * child PTE pointing at an F has been zapped, so each F holds only its table
+ * reference; drop it (freeing F) and free the table. A no-op for the common
+ * anon_vma that never promoted anything (coa_table == NULL, or a non-root).
+ */
+void thesis_coa_family_table_free(struct anon_vma *anon_vma)
+{
+	struct xarray *tbl = anon_vma->coa_table;
+	unsigned long index;
+	void *entry;
+
+	if (!tbl)
+		return;
+	xa_for_each(tbl, index, entry) {
+		if (xa_is_value(entry))		/* INPROGRESS sentinel: holds no ref */
+			continue;
+		folio_put((struct folio *)entry);
+	}
+	xa_destroy(tbl);
+	kfree(tbl);
+	anon_vma->coa_table = NULL;
+}
 
 /*
  * THESIS Pillar 2: per-phase timing of the CoA fault handler.
@@ -3316,6 +3358,12 @@ static int __init thesis_debugfs_init(void)
 	 */
 	debugfs_create_file("thesis_coa_stats", 0644, NULL, NULL,
 			    &thesis_coa_stats_fops);
+	/* THESIS V3 debug: per-path counters for the lazy handler. */
+	debugfs_create_atomic_t("thesis_coa_copier", 0444, NULL, &coa_p_copier);
+	debugfs_create_atomic_t("thesis_coa_sharer", 0444, NULL, &coa_p_sharer);
+	debugfs_create_atomic_t("thesis_coa_spin",   0444, NULL, &coa_p_spin);
+	debugfs_create_atomic_t("thesis_coa_race",   0444, NULL, &coa_p_race);
+	debugfs_create_atomic_t("thesis_coa_zero",   0444, NULL, &coa_p_zero);
 	debugfs_create_bool("thesis_coa_profile", 0644, NULL,
 			    &thesis_coa_profile);
 	return 0;
@@ -3481,7 +3529,8 @@ static vm_fault_t do_thesis_page(struct vm_fault *vmf)
  * F; every later child maps that same F read-only. Memory drops from N private
  * copies to 1 shared copy, and S is copied once instead of N times.
  *
- * Children rendezvous through thesis_coa_ptable, keyed by S's PFN:
+ * Children rendezvous through the family table (root anon_vma->coa_table),
+ * keyed by the shadow page's PFN:
  *   - win the cmpxchg(NULL -> INPROGRESS): we are the copier.
  *   - see INPROGRESS: another child is copying; return and re-fault (V3.0's
  *     active wait -- a cheap busy-loop until F is published; TODO: sleep/wake).
@@ -3491,7 +3540,7 @@ static vm_fault_t do_thesis_page(struct vm_fault *vmf)
  * reuses, thanks to the table's reference) -- giving the writer a private page
  * while F stays pristine for other children. F inherits S's ROOT anon_vma so
  * rmap_walk(F) enumerates the whole fork family, including children forked
- * later. See the thesis_coa_ptable comment for the V3.0 simplifications.
+ * later. See the coa_table comment above for the table's scope and lifetime.
  */
 static vm_fault_t do_thesis_page_lazy(struct vm_fault *vmf)
 {
@@ -3500,6 +3549,9 @@ static vm_fault_t do_thesis_page_lazy(struct vm_fault *vmf)
 	struct page *old_page;
 	struct folio *old_folio;
 	struct folio *new_folio = NULL;
+	struct anon_vma *root;
+	struct xarray *tbl;
+	pgoff_t index;
 	unsigned long s_pfn;
 	void *entry;
 	bool i_am_copier = false;
@@ -3521,19 +3573,40 @@ static vm_fault_t do_thesis_page_lazy(struct vm_fault *vmf)
 		set_pte_at(mm, vmf->address, vmf->pte, pte);
 		update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
 		pte_unmap_unlock(vmf->pte, vmf->ptl);
+		atomic_inc(&coa_p_zero);
 		return 0;
 	}
 
 	vmf->page = old_page;
 	old_folio = page_folio(old_page);
-	s_pfn = page_to_pfn(old_page);
+	s_pfn = page_to_pfn(old_page);			/* for the log line only */
+	index = linear_page_index(vma, vmf->address);	/* for F's rmap identity */
+	root = vma->anon_vma->root;
 
 	folio_get(old_folio);	/* pin the shadow across the unlocked window */
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
 
-	/* 2. RENDEZVOUS: atomically elect exactly one copier per shadow PFN. */
-	entry = xa_cmpxchg(&thesis_coa_ptable, s_pfn, NULL,
-			   THESIS_COA_INPROGRESS, GFP_KERNEL);
+	/*
+	 * Locate (or lazily create) this fork family's shared-CoA table, hung off
+	 * the root anon_vma. Two copiers in the same family can race to create it;
+	 * the cmpxchg installs exactly one and the loser frees its spare.
+	 */
+	tbl = READ_ONCE(root->coa_table);
+	if (!tbl) {
+		struct xarray *fresh = kmalloc(sizeof(*fresh), GFP_KERNEL);
+
+		if (!fresh) {
+			folio_put(old_folio);
+			return VM_FAULT_OOM;
+		}
+		xa_init(fresh);
+		if (cmpxchg(&root->coa_table, NULL, fresh))
+			kfree(fresh);		/* lost the race; another copier won */
+		tbl = READ_ONCE(root->coa_table);
+	}
+
+	/* 2. RENDEZVOUS: atomically elect exactly one copier per shadow page. */
+	entry = xa_cmpxchg(tbl, s_pfn, NULL, THESIS_COA_INPROGRESS, GFP_KERNEL);
 	if (xa_is_err(entry)) {
 		folio_put(old_folio);
 		return VM_FAULT_OOM;
@@ -3543,6 +3616,7 @@ static vm_fault_t do_thesis_page_lazy(struct vm_fault *vmf)
 	} else if (entry == THESIS_COA_INPROGRESS) {
 		/* Copy under progress: active-wait by re-faulting (PTE left as-is). */
 		folio_put(old_folio);
+		atomic_inc(&coa_p_spin);
 		return 0;
 	} else {
 		/* Already promoted: map the existing shared copy. */
@@ -3554,12 +3628,12 @@ static vm_fault_t do_thesis_page_lazy(struct vm_fault *vmf)
 	/* 3. COPIER: allocate F on the faulting CPU's local node, copy S -> F. */
 	new_folio = __folio_alloc_node(GFP_HIGHUSER_MOVABLE, 0, numa_node_id());
 	if (!new_folio) {
-		xa_erase(&thesis_coa_ptable, s_pfn);	/* release the election */
+		xa_erase(tbl, s_pfn);			/* release the election */
 		folio_put(old_folio);
 		return VM_FAULT_OOM;
 	}
 	if (__wp_page_copy_user(&new_folio->page, old_page, vmf)) {
-		xa_erase(&thesis_coa_ptable, s_pfn);
+		xa_erase(tbl, s_pfn);
 		folio_put(new_folio);
 		folio_put(old_folio);
 		return VM_FAULT_OOM;
@@ -3575,23 +3649,24 @@ static vm_fault_t do_thesis_page_lazy(struct vm_fault *vmf)
 	 * page_add_anon_rmap() below a pure mapcount bump on an already-anon folio.
 	 */
 	new_folio->mapping = (struct address_space *)
-		((void *)vma->anon_vma->root + PAGE_MAPPING_ANON);
-	new_folio->index = linear_page_index(vma, vmf->address);
+		((void *)root + PAGE_MAPPING_ANON);
+	new_folio->index = index;
 
 	/*
-	 * Publish F. The allocation reference becomes the table's long-lived
-	 * reference (leaked in V3.0); take a separate reference for our own
-	 * mapping installed below.
+	 * Publish F. The allocation reference becomes the table's reference, held
+	 * until the family's anon_vma is torn down (thesis_coa_family_table_free);
+	 * take a separate reference for our own mapping installed below.
 	 */
 	folio_get(new_folio);
-	entry = xa_store(&thesis_coa_ptable, s_pfn, new_folio, GFP_KERNEL);
+	entry = xa_store(tbl, s_pfn, new_folio, GFP_KERNEL);
 	if (xa_is_err(entry)) {
 		/*
-		 * Could not publish (ENOMEM). Reset the slot so a later faulter
-		 * retries; we still map our own F -- it degrades to a private copy
-		 * for this child, which is correct (just not shared).
+		 * Could not publish (ENOMEM). Drop the would-be table reference so F
+		 * becomes an ordinary private copy for this child (correct, just not
+		 * shared); a later faulter re-copies.
 		 */
-		xa_erase(&thesis_coa_ptable, s_pfn);
+		xa_erase(tbl, s_pfn);
+		folio_put(new_folio);
 	}
 
 install:
@@ -3601,6 +3676,7 @@ install:
 		pte_unmap_unlock(vmf->pte, vmf->ptl);
 		folio_put(new_folio);		/* drop this mapping's reference */
 		folio_put(old_folio);
+		atomic_inc(&coa_p_race);
 		return 0;
 	}
 
@@ -3617,6 +3693,7 @@ install:
 	update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
 
 	atomic_inc(&thesis_coa_faults);
+	atomic_inc(i_am_copier ? &coa_p_copier : &coa_p_sharer);
 
 	pr_info_ratelimited("THESIS [PID %d]: %s shared PFN %lx (Node %d) <- shadow PFN %lx (Node %d)\n",
 			    current->pid, i_am_copier ? "COPIED" : "shared",

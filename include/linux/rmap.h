@@ -28,6 +28,8 @@
  * the anon_vma object itself: we're guaranteed no page can be
  * pointing to this anon_vma once its vma list is empty.
  */
+struct xarray;			/* THESIS V3: for anon_vma->coa_table (see below) */
+
 struct anon_vma {
 	struct anon_vma *root;		/* Root of this anon_vma tree */
 	struct rw_semaphore rwsem;	/* W: modification, R: walking the list */
@@ -64,7 +66,24 @@ struct anon_vma {
 
 	/* Interval tree of private "related" vmas */
 	struct rb_root_cached rb_root;
+
+	/*
+	 * THESIS V3 (SHARED_LAZY): per-fork-family shared-CoA table, lazily
+	 * allocated on the ROOT anon_vma only (reached via ->root). Maps a page's
+	 * offset (folio->index) -> the shared promoted copy F, so all children of
+	 * one checkpoint find one copy instead of each making its own. Scoped to
+	 * the family and freed with the anon_vma, so it is concurrency-safe and
+	 * never outlives the shadow pages it describes. See mm/memory.c.
+	 */
+	struct xarray *coa_table;
 };
+
+/*
+ * THESIS V3: release a fork family's shared-CoA table when its root anon_vma is
+ * torn down (last family member gone). Defined in mm/memory.c; a no-op when the
+ * family never promoted anything. Called from anon_vma_free().
+ */
+void thesis_coa_family_table_free(struct anon_vma *anon_vma);
 
 /*
  * The copy-on-write semantics of fork mean that an anon_vma

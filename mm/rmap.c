@@ -102,6 +102,7 @@ static inline struct anon_vma *anon_vma_alloc(void)
 		 * from fork, the root will be reset to the parents anon_vma.
 		 */
 		anon_vma->root = anon_vma;
+		anon_vma->coa_table = NULL;	/* THESIS V3: lazily allocated */
 	}
 
 	return anon_vma;
@@ -133,6 +134,9 @@ static inline void anon_vma_free(struct anon_vma *anon_vma)
 		anon_vma_lock_write(anon_vma);
 		anon_vma_unlock_write(anon_vma);
 	}
+
+	/* THESIS V3: drop this family's shared-CoA copies (root anon_vma only). */
+	thesis_coa_family_table_free(anon_vma);
 
 	kmem_cache_free(anon_vma_cachep, anon_vma);
 }
