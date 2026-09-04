@@ -75,6 +75,8 @@ endif
 
 # THESIS: Copy-on-Access correctness test (custom fork path in mm/memory.c).
 TEST_GEN_PROGS += coa_test
+# THESIS: V3 (SHARED_LAZY) sharing/dedup test -- N children share one copy.
+TEST_GEN_PROGS += coa_share_test
 
 ifeq ($(ARCH),x86_64)
 CAN_BUILD_I386 := $(shell ./../x86/check_cc.sh "$(CC)" ../x86/trivial_32bit_program.c -m32)

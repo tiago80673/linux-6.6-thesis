@@ -61,8 +61,20 @@
 
 /* CoA prctl + algorithm modes (must match the kernel headers). */
 #define PR_SET_THESIS_COA  0x54484553   /* include/uapi/linux/prctl.h */
-#define COA_OFF   0
-#define COA_NAIVE 1
+#define COA_OFF         0
+#define COA_NAIVE       1
+#define COA_SHARED_LAZY 4
+
+/* Which promotion mode the armed tests (T1/T3) opt into. Defaults to naive so
+ * the registered kselftest is unchanged; set COA_MODE=4 to exercise V3 lazy.
+ * Both are single-child here, so lazy must produce the same correctness result
+ * (one shared copy == one private copy when there is only one child). */
+static int coa_mode(void)
+{
+	const char *e = getenv("COA_MODE");
+
+	return e ? atoi(e) : COA_NAIVE;
+}
 
 /* Select this process's CoA algorithm (per-task; inherited across fork; no root).
  * mode 0 disables. Returns 0 on success, -1 if the kernel lacks the prctl. */
@@ -221,7 +233,7 @@ int main(void)
 			 "T1 setup: %d/%d private pages resident on slow node %d\n",
 			 on_slow, NPAGES, SLOW_NODE);
 
-	if (arm_coa(COA_NAIVE))                        /* opt in: naive CoA */
+	if (arm_coa(coa_mode()))                       /* opt in: naive or lazy */
 		ksft_exit_skip("prctl(PR_SET_THESIS_COA) unsupported (non-thesis kernel?)\n");
 	c0 = read_counter();
 	pid = fork();
@@ -285,7 +297,7 @@ int main(void)
 	/* or copied; the child's writes stay visible to the parent.           */
 	/* ------------------------------------------------------------------ */
 	r = make_region(1);
-	arm_coa(COA_NAIVE);                           /* opt in (armed) */
+	arm_coa(coa_mode());                          /* opt in (armed) */
 	pid = fork();
 	if (pid == 0) {
 		pin_node(FAST_NODE);

@@ -42,6 +42,7 @@
 #include <linux/kernel_stat.h>
 #include <linux/mm.h>
 #include <linux/prctl.h>		/* THESIS: PR_THESIS_COA_* mode numbers */
+#include <linux/xarray.h>	/* THESIS: shared-CoA (V3) side table */
 #include <linux/mm_inline.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/coredump.h>
@@ -78,7 +79,9 @@
 #include <linux/ptrace.h>
 #include <linux/vmalloc.h>
 #include <linux/sched/sysctl.h>
-#include <linux/debugfs.h>
+#include <linux/timekeeping.h>	/* THESIS: ktime_get_ns() for per-phase fault timing */
+#include <linux/seq_file.h>	/* THESIS: seq_printf() for the stats debugfs file */
+#include <linux/math64.h>	/* THESIS: div_u64/div64_u64 for the stats table */
 
 #include <trace/events/kmem.h>
 
@@ -3112,15 +3115,209 @@ static inline void wp_page_reuse(struct vm_fault *vmf)
  */
 static atomic_t thesis_coa_faults = ATOMIC_INIT(0);
 
+/*
+ * THESIS V3 (SHARED_LAZY): rendezvous table for shared copy-on-access.
+ *
+ * Whereas naive CoA (do_thesis_page) copies the slow-tier shadow page into a
+ * PRIVATE local folio for every child, V3 promotes each shadow page ONCE and
+ * lets every child share that single local copy F. This table is the physical
+ * home of the per-shadow-page "copy status" keyed by the shadow page's PFN:
+ *
+ *   absent (NULL)            -> not copied yet
+ *   THESIS_COA_INPROGRESS    -> a child is copying right now; others re-fault
+ *   struct folio *F          -> the shared local copy (the "base address")
+ *
+ * The entry, when it holds F, owns ONE reference on F (folio_get at publish).
+ * That reference does double duty: it keeps F alive across gaps where no child
+ * maps it, and it forces do_wp_page to COPY rather than reuse F in place (the
+ * reuse gate requires folio_ref_count == 1; the table ref keeps it >= 2), so a
+ * writer never corrupts the page other children still read.
+ *
+ * V3.0 simplifications (assume the checkpoint owner lives forever, so the
+ * shadow and its root anon_vma never go away): entries and their F reference
+ * are never reclaimed (leaked), and the table is global rather than per-mm.
+ */
+static DEFINE_XARRAY(thesis_coa_ptable);
+#define THESIS_COA_INPROGRESS	xa_mk_value(1)
+
+/*
+ * THESIS Pillar 2: per-phase timing of the CoA fault handler.
+ *
+ * do_thesis_page() is split into phases (enum coa_phase). For each COMPLETED
+ * migration we measure the ns spent in each phase with ktime_get_ns() and fold
+ * the result into per-CPU accumulators: a running sum (mean), a max, and a log2
+ * histogram (p50/p90/p99). Aborted/raced faults are NOT recorded, so the stats
+ * describe only real migrations.
+ *
+ * Read the table at /sys/kernel/debug/thesis_coa_stats; write it to reset.
+ * Toggle instrumentation at /sys/kernel/debug/thesis_coa_profile (default on)
+ * to get the un-instrumented latency for the A/B tables. All of this only runs
+ * inside do_thesis_page(), so a stock/OFF kernel pays nothing.
+ *
+ * The phases are single-CPU today (naive V0). The shared-promotion variants
+ * (V1/V2/V3) will add rmap-walk and cross-CPU TLB-shootdown phases here -- the
+ * "how long must the world go idle" cost this harness exists to expose.
+ */
+enum coa_phase {
+	COA_P_LOCK,	/* spin_lock + pte_same validate + pte_modify */
+	COA_P_RESOLVE,	/* vm_normal_page + folio_get + drop ptl */
+	COA_P_ALLOC,	/* __folio_alloc_node (local DRAM) */
+	COA_P_COPY,	/* __wp_page_copy_user (slow-tier read) */
+	COA_P_RELOCK,	/* pte_offset_map_lock + pte_same recheck */
+	COA_P_FLUSH,	/* build PTE + ptep_clear_flush (local TLB) */
+	COA_P_INSTALL,	/* rmap add + lru + set_pte + mmu cache */
+	COA_P_TEARDOWN,	/* commit + old-folio rmap remove + folio_put x2 */
+	COA_P_TOTAL,	/* whole handler, entry -> return */
+	COA_NR_PHASES
+};
+
+static const char * const coa_phase_name[COA_NR_PHASES] = {
+	"lock", "resolve", "alloc", "copy",
+	"relock", "flush", "install", "teardown", "TOTAL",
+};
+
+/* Histogram bucket i covers [2^(i-1), 2^i) ns; bucket 0 == exactly 0 ns. */
+#define COA_HIST_BUCKETS 40
+
+struct coa_phase_stats {
+	u64 count[COA_NR_PHASES];
+	u64 sum_ns[COA_NR_PHASES];
+	u64 max_ns[COA_NR_PHASES];
+	u64 hist[COA_NR_PHASES][COA_HIST_BUCKETS];
+};
+
+static DEFINE_PER_CPU(struct coa_phase_stats, coa_stats);
+
+/* Instrumentation on by default; flip off for un-instrumented A/B latency. */
+static bool thesis_coa_profile = true;
+
+/*
+ * Close phase @idx: attribute (now - *tp) to it and advance *tp. A no-op when
+ * profiling is off, so the fault path keeps a single predictable branch.
+ */
+static inline void coa_phase(bool prof, u64 d[], int idx, u64 *tp)
+{
+	if (prof) {
+		u64 now = ktime_get_ns();
+
+		d[idx] = now - *tp;
+		*tp = now;
+	}
+}
+
+/* Fold one completed migration's per-phase durations into this CPU's stats. */
+static void thesis_coa_stats_record(const u64 d[COA_NR_PHASES])
+{
+	struct coa_phase_stats *s = get_cpu_ptr(&coa_stats);
+	int i;
+
+	for (i = 0; i < COA_NR_PHASES; i++) {
+		u64 ns = d[i];
+		unsigned int b = ns ? min_t(unsigned int, fls64(ns),
+					    COA_HIST_BUCKETS - 1) : 0;
+
+		s->count[i]++;
+		s->sum_ns[i] += ns;
+		if (ns > s->max_ns[i])
+			s->max_ns[i] = ns;
+		s->hist[i][b]++;
+	}
+	put_cpu_ptr(&coa_stats);
+}
+
+/* Percentile estimate from a log2 histogram: upper bound (2^b ns) of the
+ * bucket that crosses the target rank. Coarse by construction (powers of 2). */
+static u64 coa_hist_pct(const u64 *hist, u64 count, unsigned int pct)
+{
+	u64 target, cum = 0;
+	unsigned int b;
+
+	if (!count)
+		return 0;
+	target = div_u64(count * pct + 99, 100);	/* ceil(count*pct/100) */
+	for (b = 0; b < COA_HIST_BUCKETS; b++) {
+		cum += hist[b];
+		if (cum >= target)
+			return b ? 1ULL << b : 0;
+	}
+	return 1ULL << (COA_HIST_BUCKETS - 1);
+}
+
+static int thesis_coa_stats_show(struct seq_file *m, void *v)
+{
+	int cpu, i;
+	unsigned int b;
+
+	seq_printf(m, "%-9s %10s %10s %10s %10s %10s %12s\n",
+		   "phase", "count", "mean_ns", "p50_ns", "p90_ns",
+		   "p99_ns", "max_ns");
+
+	for (i = 0; i < COA_NR_PHASES; i++) {
+		u64 count = 0, sum = 0, maxv = 0;
+		u64 merged[COA_HIST_BUCKETS] = { 0 };
+
+		for_each_possible_cpu(cpu) {
+			struct coa_phase_stats *s = per_cpu_ptr(&coa_stats, cpu);
+
+			count += s->count[i];
+			sum   += s->sum_ns[i];
+			if (s->max_ns[i] > maxv)
+				maxv = s->max_ns[i];
+			for (b = 0; b < COA_HIST_BUCKETS; b++)
+				merged[b] += s->hist[i][b];
+		}
+		seq_printf(m, "%-9s %10llu %10llu %10llu %10llu %10llu %12llu\n",
+			   coa_phase_name[i], count,
+			   count ? div64_u64(sum, count) : 0,
+			   coa_hist_pct(merged, count, 50),
+			   coa_hist_pct(merged, count, 90),
+			   coa_hist_pct(merged, count, 99),
+			   maxv);
+	}
+	seq_printf(m, "\n(ns; percentiles are log2-bucket upper bounds. profile=%d; "
+		      "write any value to reset.)\n", thesis_coa_profile);
+	return 0;
+}
+
+static ssize_t thesis_coa_stats_write(struct file *f, const char __user *buf,
+				      size_t len, loff_t *ppos)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		memset(per_cpu_ptr(&coa_stats, cpu), 0,
+		       sizeof(struct coa_phase_stats));
+	return len;
+}
+
+static int thesis_coa_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, thesis_coa_stats_show, NULL);
+}
+
+static const struct file_operations thesis_coa_stats_fops = {
+	.owner   = THIS_MODULE,
+	.open    = thesis_coa_stats_open,
+	.read    = seq_read,
+	.write   = thesis_coa_stats_write,
+	.llseek  = seq_lseek,
+	.release = single_release,
+};
+
 static int __init thesis_debugfs_init(void)
 {
 	debugfs_create_atomic_t("thesis_coa_faults", 0444, NULL,
 				&thesis_coa_faults);
 	/*
-	 * NOTE: the algorithm is selected per-task via prctl(PR_SET_THESIS_COA,
-	 * mode), not globally -- so there is no writable mode knob here. Only the
-	 * read-only fault counter above (and, later, Pillar-2 phase stats).
+	 * The algorithm is selected per-task via prctl(PR_SET_THESIS_COA, mode),
+	 * not globally -- so there is no writable mode knob here. What we do
+	 * expose: the read-only fault counter above, the per-phase timing table
+	 * (Pillar 2), and a switch to disable that instrumentation.
 	 */
+	debugfs_create_file("thesis_coa_stats", 0644, NULL, NULL,
+			    &thesis_coa_stats_fops);
+	debugfs_create_bool("thesis_coa_profile", 0644, NULL,
+			    &thesis_coa_profile);
 	return 0;
 }
 late_initcall(thesis_debugfs_init);
@@ -3134,15 +3331,25 @@ static vm_fault_t do_thesis_page(struct vm_fault *vmf)
 	struct folio *new_folio = NULL;
 	pte_t pte, old_pte, new_pte;
 
+	/* THESIS Pillar 2: per-phase timing (only when profiling is enabled). */
+	bool prof = READ_ONCE(thesis_coa_profile);
+	u64 t0 = 0, tp = 0, d[COA_NR_PHASES] = { 0 };
+
+	if (prof) {
+		t0 = ktime_get_ns();
+		tp = t0;
+	}
+
 	// 1. LOCK AND VALIDATE (From do_numa_page)
 	spin_lock(vmf->ptl);
 	if (unlikely(!pte_same(ptep_get(vmf->pte), vmf->orig_pte))) {
 		pte_unmap_unlock(vmf->pte, vmf->ptl);
-		return 0;
+		return 0;	/* raced: not a completed migration, don't record */
 	}
 
 	old_pte = ptep_get(vmf->pte);
 	pte = pte_modify(old_pte, vma->vm_page_prot); // Strip PROT_NONE
+	coa_phase(prof, d, COA_P_LOCK, &tp);
 
 	old_page = vm_normal_page(vma, vmf->address, pte);
 	if (!old_page) {
@@ -3168,6 +3375,7 @@ static vm_fault_t do_thesis_page(struct vm_fault *vmf)
 	// Pin the old CXL folio so it doesn't get freed while we drop the lock
 	folio_get(old_folio);
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
+	coa_phase(prof, d, COA_P_RESOLVE, &tp);
 
 
 	// 2. ALLOCATE LOCAL & COPY
@@ -3187,6 +3395,7 @@ static vm_fault_t do_thesis_page(struct vm_fault *vmf)
 		folio_put(old_folio);
 		return VM_FAULT_OOM;
 	}
+	coa_phase(prof, d, COA_P_ALLOC, &tp);
 
 	// Copy the bytes from CXL to local DRAM
 	if (__wp_page_copy_user(&new_folio->page, vmf->page, vmf)) {
@@ -3196,6 +3405,7 @@ static vm_fault_t do_thesis_page(struct vm_fault *vmf)
 	}
 
 	__folio_mark_uptodate(new_folio);
+	coa_phase(prof, d, COA_P_COPY, &tp);
 
 	// 3. UPDATE PAGE TABLES
 	// Re-take the lock
@@ -3206,8 +3416,9 @@ static vm_fault_t do_thesis_page(struct vm_fault *vmf)
 		pte_unmap_unlock(vmf->pte, vmf->ptl);
 		folio_put(new_folio);
 		folio_put(old_folio);
-		return 0;
+		return 0;	/* raced after copy: discard this partial timing */
 	}
+	coa_phase(prof, d, COA_P_RELOCK, &tp);
 
 	// Build the new PTE pointing to local memory
 	new_pte = mk_pte(&new_folio->page, vma->vm_page_prot);
@@ -3219,6 +3430,7 @@ static vm_fault_t do_thesis_page(struct vm_fault *vmf)
 
 	// Replace the PROT_NONE trap with the writable, local PTE
 	ptep_clear_flush(vma, vmf->address, vmf->pte);
+	coa_phase(prof, d, COA_P_FLUSH, &tp);
 
 	// Bookkeeping for the new page
 	folio_add_new_anon_rmap(new_folio, vma, vmf->address);
@@ -3226,6 +3438,7 @@ static vm_fault_t do_thesis_page(struct vm_fault *vmf)
 
 	set_pte_at_notify(mm, vmf->address, vmf->pte, new_pte);
 	update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
+	coa_phase(prof, d, COA_P_INSTALL, &tp);
 
 	/* THESIS: migration is now committed -- count it for the sanity test. */
 	atomic_inc(&thesis_coa_faults);
@@ -3248,8 +3461,175 @@ static vm_fault_t do_thesis_page(struct vm_fault *vmf)
 	// Drop the child's original page table reference to the CXL page
 	// (If mapcount was 1, this frees the CXL page completely!)
 	folio_put(old_folio);
+	coa_phase(prof, d, COA_P_TEARDOWN, &tp);
+
+	/* Whole-handler time, then commit this completed migration's timing. */
+	if (prof) {
+		d[COA_P_TOTAL] = ktime_get_ns() - t0;
+		thesis_coa_stats_record(d);
+	}
 
 	pr_info_ratelimited("THESIS [PID %d]: Copy complete. Process has its own page!\n", current->pid);
+	return 0;
+}
+
+/*
+ * THESIS V3 (SHARED_LAZY) fault handler.
+ *
+ * Each child promotes the slow-tier shadow page S it faulted on, but only the
+ * FIRST child across the whole fork family actually copies S into a local folio
+ * F; every later child maps that same F read-only. Memory drops from N private
+ * copies to 1 shared copy, and S is copied once instead of N times.
+ *
+ * Children rendezvous through thesis_coa_ptable, keyed by S's PFN:
+ *   - win the cmpxchg(NULL -> INPROGRESS): we are the copier.
+ *   - see INPROGRESS: another child is copying; return and re-fault (V3.0's
+ *     active wait -- a cheap busy-loop until F is published; TODO: sleep/wake).
+ *   - see F: map the existing shared copy.
+ *
+ * F is mapped READ-ONLY so a write traps into do_wp_page, which COPIES (never
+ * reuses, thanks to the table's reference) -- giving the writer a private page
+ * while F stays pristine for other children. F inherits S's ROOT anon_vma so
+ * rmap_walk(F) enumerates the whole fork family, including children forked
+ * later. See the thesis_coa_ptable comment for the V3.0 simplifications.
+ */
+static vm_fault_t do_thesis_page_lazy(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	struct page *old_page;
+	struct folio *old_folio;
+	struct folio *new_folio = NULL;
+	unsigned long s_pfn;
+	void *entry;
+	bool i_am_copier = false;
+	pte_t pte, old_pte, new_pte;
+
+	/* 1. LOCK, VALIDATE, RESOLVE THE SHADOW PAGE (mirror do_thesis_page). */
+	spin_lock(vmf->ptl);
+	if (unlikely(!pte_same(ptep_get(vmf->pte), vmf->orig_pte))) {
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+		return 0;
+	}
+
+	old_pte = ptep_get(vmf->pte);
+	pte = pte_modify(old_pte, vma->vm_page_prot);	/* strip PROT_NONE */
+
+	old_page = vm_normal_page(vma, vmf->address, pte);
+	if (!old_page) {
+		/* Zero/special page: clear the trap and proceed (see do_thesis_page). */
+		set_pte_at(mm, vmf->address, vmf->pte, pte);
+		update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+		return 0;
+	}
+
+	vmf->page = old_page;
+	old_folio = page_folio(old_page);
+	s_pfn = page_to_pfn(old_page);
+
+	folio_get(old_folio);	/* pin the shadow across the unlocked window */
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+
+	/* 2. RENDEZVOUS: atomically elect exactly one copier per shadow PFN. */
+	entry = xa_cmpxchg(&thesis_coa_ptable, s_pfn, NULL,
+			   THESIS_COA_INPROGRESS, GFP_KERNEL);
+	if (xa_is_err(entry)) {
+		folio_put(old_folio);
+		return VM_FAULT_OOM;
+	}
+	if (!entry) {
+		i_am_copier = true;
+	} else if (entry == THESIS_COA_INPROGRESS) {
+		/* Copy under progress: active-wait by re-faulting (PTE left as-is). */
+		folio_put(old_folio);
+		return 0;
+	} else {
+		/* Already promoted: map the existing shared copy. */
+		new_folio = entry;
+		folio_get(new_folio);		/* this mapping's reference */
+		goto install;
+	}
+
+	/* 3. COPIER: allocate F on the faulting CPU's local node, copy S -> F. */
+	new_folio = __folio_alloc_node(GFP_HIGHUSER_MOVABLE, 0, numa_node_id());
+	if (!new_folio) {
+		xa_erase(&thesis_coa_ptable, s_pfn);	/* release the election */
+		folio_put(old_folio);
+		return VM_FAULT_OOM;
+	}
+	if (__wp_page_copy_user(&new_folio->page, old_page, vmf)) {
+		xa_erase(&thesis_coa_ptable, s_pfn);
+		folio_put(new_folio);
+		folio_put(old_folio);
+		return VM_FAULT_OOM;
+	}
+	__folio_set_swapbacked(new_folio);
+	__folio_mark_uptodate(new_folio);
+
+	/*
+	 * Seed F's anon rmap identity from the shadow's fork family: anchor F to
+	 * the ROOT anon_vma (the common ancestor of every child, current and
+	 * future) so rmap_walk(F) can enumerate all mappers. This mirrors
+	 * __page_set_anon_rmap()'s !exclusive path; doing it up front makes every
+	 * page_add_anon_rmap() below a pure mapcount bump on an already-anon folio.
+	 */
+	new_folio->mapping = (struct address_space *)
+		((void *)vma->anon_vma->root + PAGE_MAPPING_ANON);
+	new_folio->index = linear_page_index(vma, vmf->address);
+
+	/*
+	 * Publish F. The allocation reference becomes the table's long-lived
+	 * reference (leaked in V3.0); take a separate reference for our own
+	 * mapping installed below.
+	 */
+	folio_get(new_folio);
+	entry = xa_store(&thesis_coa_ptable, s_pfn, new_folio, GFP_KERNEL);
+	if (xa_is_err(entry)) {
+		/*
+		 * Could not publish (ENOMEM). Reset the slot so a later faulter
+		 * retries; we still map our own F -- it degrades to a private copy
+		 * for this child, which is correct (just not shared).
+		 */
+		xa_erase(&thesis_coa_ptable, s_pfn);
+	}
+
+install:
+	/* 4. INSTALL: re-take the lock, re-validate, point our PTE at F READ-ONLY. */
+	vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);
+	if (unlikely(!pte_same(ptep_get(vmf->pte), vmf->orig_pte))) {
+		pte_unmap_unlock(vmf->pte, vmf->ptl);
+		folio_put(new_folio);		/* drop this mapping's reference */
+		folio_put(old_folio);
+		return 0;
+	}
+
+	new_pte = mk_pte(&new_folio->page, vma->vm_page_prot);
+	new_pte = pte_sw_mkyoung(new_pte);
+	new_pte = pte_wrprotect(new_pte);	/* shared: force RO so writes COW */
+
+	ptep_clear_flush(vma, vmf->address, vmf->pte);
+
+	/* Add this child to F's rmap (mapcount++); mapping is already anon. */
+	page_add_anon_rmap(&new_folio->page, vma, vmf->address, RMAP_NONE);
+
+	set_pte_at_notify(mm, vmf->address, vmf->pte, new_pte);
+	update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
+
+	atomic_inc(&thesis_coa_faults);
+
+	pr_info_ratelimited("THESIS [PID %d]: %s shared PFN %lx (Node %d) <- shadow PFN %lx (Node %d)\n",
+			    current->pid, i_am_copier ? "COPIED" : "shared",
+			    folio_pfn(new_folio), folio_nid(new_folio),
+			    s_pfn, page_to_nid(old_page));
+
+	/* Detach this child from the shadow page. */
+	page_remove_rmap(old_page, vma, false);
+
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+
+	folio_put(old_folio);	/* drop the pin we took */
+	folio_put(old_folio);	/* drop the child's fork reference to the shadow */
 	return 0;
 }
 
@@ -5229,9 +5609,10 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
 			switch (current->thesis_coa_mode) {
 			case THESIS_COA_NAIVE:
 				return do_thesis_page(vmf);
+			case THESIS_COA_SHARED_LAZY:
+				return do_thesis_page_lazy(vmf);
 			case THESIS_COA_SHARED_SYNC:
 			case THESIS_COA_SHARED_ASYNC:
-			case THESIS_COA_SHARED_LAZY:
 				/*
 				 * Reserved variants -- handlers not written yet.
 				 * Fall back to naive so the mode is still runnable
