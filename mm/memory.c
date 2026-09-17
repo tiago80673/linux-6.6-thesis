@@ -3223,8 +3223,48 @@ static const char * const coa_phase_name[COA_NR_PHASES] = {
 	"relock", "flush", "install", "teardown", "TOTAL",
 };
 
-/* Histogram bucket i covers [2^(i-1), 2^i) ns; bucket 0 == exactly 0 ns. */
-#define COA_HIST_BUCKETS 40
+/*
+ * Latency histogram with sub-octave resolution.
+ *
+ * One bucket per power of two gives percentiles that are only accurate to a
+ * FACTOR OF TWO -- a reported p99 of 1024ns means "somewhere in [512,1024)",
+ * which is why such a table shows nothing but 64/128/256/512/1024 and reads as
+ * if the timer were quantised. COA_SUB buckets per octave narrows that to
+ * ~1/COA_SUB (12.5%), which is enough to distinguish the phases we care about.
+ *
+ * Layout (HdrHistogram-style): values below COA_SUB are exact; above it, a
+ * bucket is identified by the exponent plus the top COA_SUB_BITS bits of the
+ * mantissa. Reported percentiles are the bucket's LOWER bound.
+ */
+#define COA_SUB_BITS 3
+#define COA_SUB (1u << COA_SUB_BITS)
+#define COA_HIST_MAXEXP 30			/* ~1.07s; above this saturates */
+#define COA_HIST_BUCKETS ((COA_HIST_MAXEXP + 2) * COA_SUB)
+
+static inline unsigned int coa_hist_bucket(u64 ns)
+{
+	unsigned int e;
+
+	if (ns < COA_SUB)
+		return (unsigned int)ns;
+	e = fls64(ns) - 1;			/* floor(log2(ns)) >= COA_SUB_BITS */
+	if (e > COA_HIST_MAXEXP)
+		return COA_HIST_BUCKETS - 1;
+	return ((e + 1) << COA_SUB_BITS) |
+	       (unsigned int)((ns >> (e - COA_SUB_BITS)) & (COA_SUB - 1));
+}
+
+/* Lowest value that lands in bucket @b. */
+static inline u64 coa_hist_floor(unsigned int b)
+{
+	unsigned int e, m;
+
+	if (b < (COA_SUB << 1))			/* exact region, plus unused gap */
+		return b;
+	e = (b >> COA_SUB_BITS) - 1;
+	m = b & (COA_SUB - 1);
+	return (u64)(COA_SUB + m) << (e - COA_SUB_BITS);
+}
 
 enum coa_path {
 	COA_PATH_PRIVATE,	/* do_thesis_page(): copies unconditionally */
@@ -3286,8 +3326,7 @@ static void thesis_coa_stats_record(enum coa_path path, const u64 d[COA_NR_PHASE
 
 	for (i = 0; i < COA_NR_PHASES; i++) {
 		u64 ns = d[i];
-		unsigned int b = ns ? min_t(unsigned int, fls64(ns),
-					    COA_HIST_BUCKETS - 1) : 0;
+		unsigned int b = coa_hist_bucket(ns);
 
 		s->count[i]++;
 		s->sum_ns[i] += ns;
@@ -3311,15 +3350,23 @@ static u64 coa_hist_pct(const u64 *hist, u64 count, unsigned int pct)
 	for (b = 0; b < COA_HIST_BUCKETS; b++) {
 		cum += hist[b];
 		if (cum >= target)
-			return b ? 1ULL << b : 0;
+			return coa_hist_floor(b);
 	}
-	return 1ULL << (COA_HIST_BUCKETS - 1);
+	return coa_hist_floor(COA_HIST_BUCKETS - 1);
 }
 
 static int thesis_coa_stats_show(struct seq_file *m, void *v)
 {
 	int cpu, i, path;
 	unsigned int b;
+	/*
+	 * Heap, not stack: with sub-octave buckets this array alone is 2KB and
+	 * blows the kernel's frame-size limit.
+	 */
+	u64 *merged = kmalloc_array(COA_HIST_BUCKETS, sizeof(*merged), GFP_KERNEL);
+
+	if (!merged)
+		return -ENOMEM;
 
 	/*
 	 * One table per PATH, not one table overall. A fault that takes the
@@ -3343,8 +3390,8 @@ static int thesis_coa_stats_show(struct seq_file *m, void *v)
 
 	for (i = 0; i < COA_NR_PHASES; i++) {
 		u64 count = 0, sum = 0, maxv = 0;
-		u64 merged[COA_HIST_BUCKETS] = { 0 };
 
+		memset(merged, 0, COA_HIST_BUCKETS * sizeof(*merged));
 		for_each_possible_cpu(cpu) {
 			struct coa_phase_stats *s =
 				&(*per_cpu_ptr(&coa_stats, cpu))[path];
@@ -3370,8 +3417,10 @@ static int thesis_coa_stats_show(struct seq_file *m, void *v)
 
 	seq_printf(m, "\nfamily metadata: root anon_vma on node %d, coa_table on node %d\n",
 		   READ_ONCE(coa_dbg_root_nid), READ_ONCE(coa_dbg_tbl_nid));
-	seq_printf(m, "(ns; percentiles are log2-bucket upper bounds. profile=%d; "
-		      "write any value to reset.)\n", thesis_coa_profile);
+	seq_printf(m, "(ns. mean/max are exact; p50/p90/p99 are histogram bucket "
+		      "lower bounds, resolution ~%u%%. profile=%d; write any value "
+		      "to reset.)\n", 100 / COA_SUB, thesis_coa_profile);
+	kfree(merged);
 	return 0;
 }
 
