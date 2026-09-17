@@ -3254,6 +3254,10 @@ static inline unsigned int coa_hist_bucket(u64 ns)
 	       (unsigned int)((ns >> (e - COA_SUB_BITS)) & (COA_SUB - 1));
 }
 
+/* Samples at or above @floor_ns. A max 20x above p99 is either a single
+ * scheduling artefact or a real tail, and only a count can tell them apart. */
+static u64 coa_hist_above(const u64 *hist, u64 floor_ns);
+
 /* Lowest value that lands in bucket @b. */
 static inline u64 coa_hist_floor(unsigned int b)
 {
@@ -3279,6 +3283,7 @@ static const char * const coa_path_name[COA_NR_PATHS] = {
 };
 
 struct coa_phase_stats {
+	u64 preempted;		/* faults that went off-CPU mid-measurement */
 	u64 count[COA_NR_PHASES];
 	u64 sum_ns[COA_NR_PHASES];
 	u64 max_ns[COA_NR_PHASES];
@@ -3308,6 +3313,17 @@ static int coa_dbg_tbl_nid  = -1;
  * Close phase @idx: attribute (now - *tp) to it and advance *tp. A no-op when
  * profiling is off, so the fault path keeps a single predictable branch.
  */
+/* Voluntary + involuntary context switches for the current task. */
+static inline u64 coa_switches(void)
+{
+	return current->nvcsw + current->nivcsw;
+}
+
+static inline bool coa_switched(u64 before)
+{
+	return coa_switches() != before;
+}
+
 static inline void coa_phase(bool prof, u64 d[], int idx, u64 *tp)
 {
 	if (prof) {
@@ -3319,9 +3335,19 @@ static inline void coa_phase(bool prof, u64 d[], int idx, u64 *tp)
 }
 
 /* Fold one completed migration's per-phase durations into this CPU's stats. */
-static void thesis_coa_stats_record(enum coa_path path, const u64 d[COA_NR_PHASES])
+/*
+ * Phases are wall-clock deltas, so anything that takes the task off-CPU during
+ * one -- preemption, an interrupt, or the host descheduling our vCPU -- is
+ * charged to that phase. Counting the context switches across the fault says
+ * how much of the tail is that rather than real work.
+ */
+static void thesis_coa_stats_record(enum coa_path path, const u64 d[COA_NR_PHASES],
+				    bool preempted)
 {
 	struct coa_phase_stats *s = &(*get_cpu_ptr(&coa_stats))[path];
+
+	if (preempted)
+		s->preempted++;
 	int i;
 
 	for (i = 0; i < COA_NR_PHASES; i++) {
@@ -3339,20 +3365,31 @@ static void thesis_coa_stats_record(enum coa_path path, const u64 d[COA_NR_PHASE
 
 /* Percentile estimate from a log2 histogram: upper bound (2^b ns) of the
  * bucket that crosses the target rank. Coarse by construction (powers of 2). */
-static u64 coa_hist_pct(const u64 *hist, u64 count, unsigned int pct)
+/* @permille: 500 = p50, 990 = p99, 999 = p99.9. */
+static u64 coa_hist_pct(const u64 *hist, u64 count, unsigned int permille)
 {
 	u64 target, cum = 0;
 	unsigned int b;
 
 	if (!count)
 		return 0;
-	target = div_u64(count * pct + 99, 100);	/* ceil(count*pct/100) */
+	target = div_u64(count * permille + 999, 1000);
 	for (b = 0; b < COA_HIST_BUCKETS; b++) {
 		cum += hist[b];
 		if (cum >= target)
 			return coa_hist_floor(b);
 	}
 	return coa_hist_floor(COA_HIST_BUCKETS - 1);
+}
+
+static u64 coa_hist_above(const u64 *hist, u64 floor_ns)
+{
+	unsigned int b = coa_hist_bucket(floor_ns);
+	u64 n = 0;
+
+	for (; b < COA_HIST_BUCKETS; b++)
+		n += hist[b];
+	return n;
 }
 
 static int thesis_coa_stats_show(struct seq_file *m, void *v)
@@ -3383,10 +3420,19 @@ static int thesis_coa_stats_show(struct seq_file *m, void *v)
 		if (!path_total)
 			continue;
 
-		seq_printf(m, "\n[%s]  %llu fault(s)\n", coa_path_name[path], path_total);
-		seq_printf(m, "%-9s %10s %10s %10s %10s %10s %12s\n",
+		{
+		u64 pre = 0;
+
+		for_each_possible_cpu(cpu)
+			pre += (*per_cpu_ptr(&coa_stats, cpu))[path].preempted;
+		seq_printf(m, "\n[%s]  %llu fault(s), %llu (%llu.%02llu%%) went off-CPU mid-fault\n",
+			   coa_path_name[path], path_total, pre,
+			   path_total ? pre * 100 / path_total : 0,
+			   path_total ? (pre * 10000 / path_total) % 100 : 0);
+		}
+		seq_printf(m, "%-9s %10s %9s %8s %8s %8s %9s %10s %8s\n",
 			   "phase", "count", "mean_ns", "p50_ns", "p90_ns",
-			   "p99_ns", "max_ns");
+			   "p99_ns", "p99.9_ns", "max_ns", ">=10us");
 
 	for (i = 0; i < COA_NR_PHASES; i++) {
 		u64 count = 0, sum = 0, maxv = 0;
@@ -3405,13 +3451,15 @@ static int thesis_coa_stats_show(struct seq_file *m, void *v)
 		}
 		if (!count)
 			continue;
-		seq_printf(m, "%-9s %10llu %10llu %10llu %10llu %10llu %12llu\n",
+		seq_printf(m, "%-9s %10llu %9llu %8llu %8llu %8llu %9llu %10llu %8llu\n",
 			   coa_phase_name[i], count,
 			   count ? div64_u64(sum, count) : 0,
-			   coa_hist_pct(merged, count, 50),
-			   coa_hist_pct(merged, count, 90),
-			   coa_hist_pct(merged, count, 99),
-			   maxv);
+			   coa_hist_pct(merged, count, 500),
+			   coa_hist_pct(merged, count, 900),
+			   coa_hist_pct(merged, count, 990),
+			   coa_hist_pct(merged, count, 999),
+			   maxv,
+			   coa_hist_above(merged, 10000));
 		}
 	}
 
@@ -3487,6 +3535,7 @@ static vm_fault_t do_thesis_page(struct vm_fault *vmf)
 	/* THESIS Pillar 2: per-phase timing (only when profiling is enabled). */
 	bool prof = READ_ONCE(thesis_coa_profile);
 	u64 t0 = 0, tp = 0, d[COA_NR_PHASES] = { 0 };
+	u64 sw0 = coa_switches();
 
 	if (prof) {
 		t0 = ktime_get_ns();
@@ -3620,7 +3669,8 @@ static vm_fault_t do_thesis_page(struct vm_fault *vmf)
 	/* Whole-handler time, then commit this completed migration's timing. */
 	if (prof) {
 		d[COA_P_TOTAL] = ktime_get_ns() - t0;
-		thesis_coa_stats_record(COA_PATH_PRIVATE, d);
+		thesis_coa_stats_record(COA_PATH_PRIVATE, d,
+					coa_switched(sw0));
 	}
 
 	pr_info_ratelimited("THESIS [PID %d]: Copy complete. Process has its own page!\n", current->pid);
@@ -3674,6 +3724,7 @@ static vm_fault_t do_thesis_page_lazy(struct vm_fault *vmf)
 	bool prof = READ_ONCE(thesis_coa_profile);
 	u64 tp = prof ? ktime_get_ns() : 0;
 	u64 t0 = tp;
+	u64 sw0 = coa_switches();
 
 	/* 1. LOCK, VALIDATE, RESOLVE THE SHADOW PAGE (mirror do_thesis_page). */
 	spin_lock(vmf->ptl);
@@ -3765,7 +3816,8 @@ static vm_fault_t do_thesis_page_lazy(struct vm_fault *vmf)
 			coa_phase(prof, d, COA_P_BAIL, &tp);
 			if (prof) {
 				d[COA_P_TOTAL] = ktime_get_ns() - t0;
-				thesis_coa_stats_record(COA_PATH_SPIN, d);
+				thesis_coa_stats_record(COA_PATH_SPIN, d,
+					coa_switched(sw0));
 			}
 			return 0;
 		}
@@ -3793,7 +3845,8 @@ static vm_fault_t do_thesis_page_lazy(struct vm_fault *vmf)
 			atomic_inc(&coa_p_spin);
 		if (prof) {
 			d[COA_P_TOTAL] = ktime_get_ns() - t0;
-			thesis_coa_stats_record(COA_PATH_SPIN, d);
+			thesis_coa_stats_record(COA_PATH_SPIN, d,
+					coa_switched(sw0));
 		}
 		return 0;
 	} else {
@@ -3892,7 +3945,8 @@ install:
 	if (prof) {
 		d[COA_P_TOTAL] = ktime_get_ns() - t0;
 		thesis_coa_stats_record(i_am_copier ? COA_PATH_COPIER
-						   : COA_PATH_SHARER, d);
+						   : COA_PATH_SHARER, d,
+					coa_switched(sw0));
 	}
 
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
