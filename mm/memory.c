@@ -3131,9 +3131,8 @@ static atomic_t thesis_coa_faults = ATOMIC_INIT(0);
  *
  * Keying by the physical shadow PFN records the promotion against the page's
  * physical identity, so every virtual address that resolves this S finds the one
- * F (and aliased mappings dedup to it). Within a live family the PFN is unique
- * per logical page and stable: the checkpoint parent pins every S, so none is
- * freed (hence no PFN reuse) while the family -- and this table -- lives.
+ * F (and aliased mappings dedup to it). That only works while the key keeps
+ * meaning the same page, which the table has to enforce itself -- see below.
  *
  * Scoping to the root anon_vma (rather than a global table) is what makes this
  * correct AND concurrency-safe: every child of one checkpoint shares that root,
@@ -3142,11 +3141,38 @@ static atomic_t thesis_coa_faults = ATOMIC_INIT(0);
  * so an entry never outlives the shadow pages it describes, and a recycled PFN
  * can never resolve to a stale F from a dead family.
  *
- * The entry, when it holds F, owns ONE reference on F (folio_get at publish).
- * That reference does double duty: it keeps F alive across gaps where no child
- * maps it, and it forces do_wp_page to COPY rather than reuse F in place (the
- * reuse gate requires folio_ref_count == 1; the table ref keeps it >= 2), so a
- * writer never corrupts the page other children still read.
+ * TWO PAGES, TWO REFERENCES. A published entry owns one reference on F and one
+ * on S, and in both cases the single reference does the same double duty: it
+ * keeps the page alive, and it holds the refcount at >= 2 so do_wp_page's
+ * reuse-in-place gate (which requires folio_ref_count == 1) fails and a writer
+ * is forced down the copy path.
+ *
+ * On F that stops a writing child from corrupting the page its siblings read.
+ * On S it is what makes PFN keying sound at all, and it was missing until B1
+ * (bench/bugs/B1_shared_lazy_second_generation.md). The handler DETACHES a
+ * child from S the moment it faults -- page_remove_rmap() and two folio_put()
+ * at the bottom of do_thesis_page_lazy() -- so once a page has been promoted,
+ * S is back to refcount 1, parent-only, while that child is still running.
+ * The parent could then:
+ *
+ *   - write S IN PLACE, because at refcount 1 do_wp_page reuses rather than
+ *     copies. Same PFN, new bytes, and the entry still points at a copy of the
+ *     old ones -- so the next child to fault there was handed stale data. That
+ *     is silent: it corrupts rather than crashes, and it needed no generation
+ *     boundary, just a sibling forked after the write; or
+ *   - free S outright, after which the PFN is recycled into an unrelated page
+ *     and the entry describes memory that no longer exists.
+ *
+ * Holding a reference closes both: S cannot be freed while the entry lives, so
+ * the key cannot be recycled, and a parent write now copies, so the promoted
+ * snapshot stays the fork-time bytes the children are entitled to. It also
+ * makes copy_present_pte()'s stated intent -- "if the parent writes, we want to
+ * keep the original data at the moment of the fork for the children" -- true of
+ * promoted pages, which it was not before.
+ *
+ * The reference costs nothing extra to acquire: the copier already pins S
+ * across its unlocked window, and on a successful publish that pin simply
+ * becomes the table's. It is released in thesis_coa_family_table_free().
  */
 #define THESIS_COA_INPROGRESS	xa_mk_value(1)
 
@@ -3163,6 +3189,11 @@ static atomic_t coa_p_zero   = ATOMIC_INIT(0);	/* vm_normal_page NULL bail */
  * child PTE pointing at an F has been zapped, so each F holds only its table
  * reference; drop it (freeing F) and free the table. A no-op for the common
  * anon_vma that never promoted anything (coa_table == NULL, or a non-root).
+ *
+ * Each entry owns a reference on its SHADOW page as well (see the two-reference
+ * note on the table above). The entry is keyed by that page's PFN, so the folio
+ * is recoverable from the key itself -- the table stores one pointer per entry,
+ * not two, and the fault path allocates nothing extra to make this work.
  */
 void thesis_coa_family_table_free(struct anon_vma *anon_vma)
 {
@@ -3175,7 +3206,9 @@ void thesis_coa_family_table_free(struct anon_vma *anon_vma)
 	xa_for_each(tbl, index, entry) {
 		if (xa_is_value(entry))		/* INPROGRESS sentinel: holds no ref */
 			continue;
-		folio_put((struct folio *)entry);
+		folio_put((struct folio *)entry);		/* the copy F */
+		if (pfn_valid(index))
+			folio_put(page_folio(pfn_to_page(index)));	/* the shadow S */
 	}
 	xa_destroy(tbl);
 	kfree(tbl);
@@ -3711,6 +3744,11 @@ static vm_fault_t do_thesis_page_lazy(struct vm_fault *vmf)
 	unsigned long s_pfn;
 	void *entry;
 	bool i_am_copier = false;
+	/*
+	 * Set once this fault's pin on S has been donated to the table as the
+	 * entry's shadow reference, so the paths below know not to drop it.
+	 */
+	bool table_owns_shadow = false;
 	pte_t pte, old_pte, new_pte;
 	/*
 	 * Measured on equal terms with do_thesis_page(). Previously only the
@@ -3896,10 +3934,17 @@ static vm_fault_t do_thesis_page_lazy(struct vm_fault *vmf)
 		/*
 		 * Could not publish (ENOMEM). Drop the would-be table reference so F
 		 * becomes an ordinary private copy for this child (correct, just not
-		 * shared); a later faulter re-copies.
+		 * shared); a later faulter re-copies. No entry means no shadow
+		 * reference either, so our pin is dropped normally below.
 		 */
 		xa_erase(tbl, s_pfn);
 		folio_put(new_folio);
+	} else {
+		/*
+		 * Published. The pin we took on S becomes the entry's reference on
+		 * it, keeping the key meaningful for as long as the entry lives.
+		 */
+		table_owns_shadow = true;
 	}
 
 install:
@@ -3909,7 +3954,13 @@ install:
 	if (unlikely(!pte_same(ptep_get(vmf->pte), vmf->orig_pte))) {
 		pte_unmap_unlock(vmf->pte, vmf->ptl);
 		folio_put(new_folio);		/* drop this mapping's reference */
-		folio_put(old_folio);
+		/*
+		 * Our PTE still points at S, so the fork reference stays; only the
+		 * pin is ours to drop -- and not even that if a successful publish
+		 * has already handed it to the table.
+		 */
+		if (!table_owns_shadow)
+			folio_put(old_folio);
 		if (READ_ONCE(thesis_coa_count))
 			atomic_inc(&coa_p_race);
 		return 0;
@@ -3951,8 +4002,9 @@ install:
 
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
 
-	folio_put(old_folio);	/* drop the pin we took */
 	folio_put(old_folio);	/* drop the child's fork reference to the shadow */
+	if (!table_owns_shadow)
+		folio_put(old_folio);	/* drop the pin we took */
 	return 0;
 }
 
